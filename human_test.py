@@ -10,9 +10,8 @@ try:
     from env.game import GameEnv
     from env.utils import format_hand, parse_input_string
 except ImportError:
-    # 如果是在 guandan 目录下直接运行，尝试带包名的引用
-    from env.game import GameEnv
-    from env.utils import format_hand, parse_input_string
+    from guandan.env.game import GameEnv
+    from guandan.env.utils import format_hand, parse_input_string
 
 def clear_screen():
     print("\n" * 3)
@@ -24,7 +23,15 @@ def print_table(info):
     teammate = (me + 2) % 4
     left = (me + 3) % 4
     
-    header = f"当前级牌: {info.cur_level} | 当前操作者: Player {me}"
+    # 将数字级牌转换为显示字符 (14->A, 10->T)
+    level_str = str(info.cur_level)
+    if info.cur_level == 10: level_str = '10'
+    elif info.cur_level == 11: level_str = 'J'
+    elif info.cur_level == 12: level_str = 'Q'
+    elif info.cur_level == 13: level_str = 'K'
+    elif info.cur_level == 14: level_str = 'A'
+    
+    header = f"当前级牌: {level_str} | 当前操作者: Player {me}"
     print(header.center(60))
     print("-" * 60)
     
@@ -39,7 +46,6 @@ def print_table(info):
     print("-" * 60)
     
     if info.last_move:
-        # 注意：这里我们无法直接获取上家的名字，只能通过 info.last_pid
         last_move_str = format_hand(info.last_move)
         last_pid_str = f"桌面最后出牌 (P{info.last_pid})"
         print(f"{last_pid_str}: {last_move_str}")
@@ -51,18 +57,40 @@ def print_table(info):
     print(format_hand(info.my_hand))
     print("-" * 60)
 
+def get_start_level():
+    """获取初始级牌设置"""
+    rank_map = {
+        '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
+        '10': 10, 'T': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14
+    }
+    
+    while True:
+        clear_screen()
+        print("--- 游戏设置 ---")
+        user_input = input("请输入当前级牌 (2-A, 默认2): ").strip().upper()
+        
+        if not user_input:
+            return 2 # 默认打2
+            
+        if user_input in rank_map:
+            return rank_map[user_input]
+            
+        print("输入无效，请输入 2, 3... 10, J, Q, K, A")
+        time.sleep(1)
+
 def main():
+    # 1. 获取级牌设定
+    start_level = get_start_level()
+    
     env = GameEnv()
-    info = env.reset(current_level=2) 
+    # 2. 传入设定的级牌
+    info = env.reset(current_level=start_level) 
 
     while not env.game_over:
         clear_screen()
         print_table(info)
 
-        # === 修改点：所有玩家都由人类控制，方便测试规则 ===
-        # 原来的逻辑是 if info.player_id == 0 else AI
-        # 现在全部开放给输入
-        
+        # 所有玩家由人类控制
         valid_input = False
         while not valid_input:
             prompt = f"[Player {info.player_id}] 请出牌 (空格分隔, 如 'H2 S2' 或 'pass'): "
@@ -78,19 +106,20 @@ def main():
                 except ValueError as e:
                     print(f"输入错误: {e}")
 
-        # 提交动作
         next_info, _, done, result = env.step(action)
         
-        # 错误检查
         if 'error' in result:
             print(f"!!! 出牌无效: {result['error']} !!!")
             print("按回车键重试...")
             input()
-            continue # 重试，不更新 info
+            continue 
             
         info = next_info
 
+    clear_screen()
     print("游戏结束!")
+    if 'result' in result:
+        print(f"结果: {result['result']['desc']}")
     print(f"出牌顺序: {env.winner_order}")
 
 if __name__ == "__main__":
