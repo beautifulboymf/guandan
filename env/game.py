@@ -55,22 +55,17 @@ class GameEnv:
         return info
 
     def step(self, action):
-        """
-        执行动作
-        action: list of card_ids (空列表代表PASS)
-        """
+        """执行动作"""
         player = self.current_player
         cur_level_idx = self.cur_level - 2 
         
         # === 1. 强制出牌检查 ===
-        # 如果桌面为空（获得出牌权），或者是自己出的最后一手（理论上会被清空逻辑覆盖，但也做防御），决不允许 PASS
         if not self.last_move or self.last_pid == player:
             if len(action) == 0:
                 return self.get_infoset(), 0, False, {'error': '必须出牌 (Cannot Pass)'}
 
         # === 2. 动作处理 ===
         if len(action) > 0:
-            # --- 出牌逻辑 ---
             # A. 合法性检查
             move_info = MoveDetector.get_move_type(action, cur_level_idx)
             if move_info is None:
@@ -85,14 +80,12 @@ class GameEnv:
             # C. 执行出牌
             self.last_move = action
             self.last_pid = player
-            self.pass_count = 0  # 有人出牌，PASS计数清零
-            
+            self.pass_count = 0 
             for card in action:
                 self.players_hand[player].remove(card)
             print(f"玩家 {player} 出牌: {move_info['type']} (Rank {move_info['rank']})")
 
         else:
-            # --- PASS 逻辑 ---
             self.pass_count += 1
             print(f"玩家 {player} PASS")
 
@@ -102,74 +95,65 @@ class GameEnv:
                 self.winner_order.append(player)
                 print(f"*** 玩家 {player} 出完了! (第 {len(self.winner_order)} 名) ***")
 
-        # === 4. 胜负判定 (Game Over Check) ===
-        # 只要有3个人出完，或者同队的两人都出完（双上），游戏结束
-        # 简化判定：winner_order 达到 3 人，或者 双上
+        # === 4. 胜负判定 ===
         is_over = False
         if len(self.winner_order) >= 3:
             is_over = True
         elif len(self.winner_order) == 2:
-            # 检查是不是双上 (0和2是一队，1和3是一队)
             p1, p2 = self.winner_order
             if (p1 % 2) == (p2 % 2):
-                is_over = True # 双上，不用等那俩倒霉蛋了
+                is_over = True 
 
         if is_over:
             self.game_over = True
             result = self._calculate_result()
             return self.get_infoset(), 0, True, {'result': result}
 
-        # === 5. 轮转与接风逻辑 (Next Player Logic) ===
+        # === 5. 轮转与接风逻辑 (已修正 Bug) ===
         
-        # 计算在场的活跃玩家数量 (没出完牌的人)
         active_players = [i for i in range(4) if len(self.players_hand[i]) > 0]
         num_active = len(active_players)
         
-        # 寻找下一个出牌者（普通轮转）
+        # 寻找下一个出牌者
         next_p = (player + 1) % 4
         while next_p not in active_players:
             next_p = (next_p + 1) % 4
         
-        # 检查是否由于连续 PASS 导致需要清空桌面（接风/获得球权）
-        # 触发条件：连续 PASS 的人数 == 当前在场人数 - 1
-        # (例如剩4人，3人PASS，第4人获得球权；剩2人，1人PASS，另1人获得)
-        # 注意：如果是刚刚出牌的那个人自己出完了，pass_count 是 0，逻辑在下面处理
-        
         should_clear_table = False
-        winner_next_p = next_p # 默认下家
+        winner_next_p = next_p 
 
-        if self.pass_count >= num_active - 1:
-            # --- 一圈没人要，准备清空桌面 ---
-            print(f"--- 一圈没人要 (Pass Count: {self.pass_count}) ---")
+        # --- 修正逻辑开始 ---
+        # 计算清台所需的 PASS 数量
+        # 如果牌主(last_pid)还在场，只要 N-1 个人不要就行（除了牌主自己）
+        # 如果牌主(last_pid)已离场，需要 N 个人都不要（剩下所有人）
+        if len(self.players_hand[self.last_pid]) > 0:
+            pass_threshold = num_active - 1
+        else:
+            pass_threshold = num_active # 必须所有人PASS
+
+        if self.pass_count >= pass_threshold:
+            print(f"--- 所有人不要 (Pass Count: {self.pass_count}) ---")
             should_clear_table = True
             
-            # 关键：谁来接风？
-            # 正常情况：最后出牌的人 (last_pid) 获得球权
+            # 接风逻辑
             if len(self.players_hand[self.last_pid]) > 0:
                 winner_next_p = self.last_pid
                 print(f"-> 玩家 {winner_next_p} 获得出牌权")
             else:
-                # 特殊情况：最后出牌的人已经出完走了 (头游/二游) -> 【接风规则】
-                # 规则：优先给对家接风
+                # 牌主已走，优先对家接风
                 teammate = (self.last_pid + 2) % 4
                 if len(self.players_hand[teammate]) > 0:
                     winner_next_p = teammate
                     print(f"-> 最大牌玩家已走，队友 {winner_next_p} 接风")
                 else:
-                    # 如果对家也走了（极其罕见，通常双上就结束了，除非是特殊规则），给下家
-                    # 下家就是目前算出来的 next_p
                     winner_next_p = next_p
                     print(f"-> 最大牌玩家及队友均已走，下家 {winner_next_p} 接风")
             
-            # 重置 PASS 计数
             self.pass_count = 0
-
-        # 如果刚才出牌的人出完了（且不是接风情况，即有人刚出完牌，还没轮一圈），
-        # 此时 pass_count=0，next_p 正常流转给下家，桌面保持（下家必须管）
-        # 除非它是最后一张且最大... 那个逻辑由上面的 pass_count 累积后的下一轮处理
+        # --- 修正逻辑结束 ---
         
         if should_clear_table:
-            self.last_move = [] # 清空桌面
+            self.last_move = []
             self.current_player = winner_next_p
         else:
             self.current_player = next_p
