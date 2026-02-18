@@ -63,9 +63,6 @@ class GameEnv:
         
         if len(action) > 0 and move_info is None:
              print(f"非法牌型: {action}")
-             # 返回错误，不做任何状态变更
-             # 这里为了简单，如果非法，强制变为 PASS，或者抛异常让 UI 处理
-             # 为了 human_test 体验，我们返回一个标记让 UI 提示重输
              return self.get_infoset(), 0, False, {'error': 'Invalid Move Type'}
 
         # --- 2. 验证是否能管住上家 ---
@@ -90,13 +87,38 @@ class GameEnv:
                 return self.get_infoset(), 0, False, {'error': 'Cannot Pass on First Move'}
             print(f"玩家 {player} PASS")
 
-        # ... (后续的出完牌判定、轮转逻辑保持不变) ...
-        
-        # (最后加上 return)
-        return self.get_infoset(), 0, self.game_over, {}
+        # --- 3. 检查是否出完 (胜负判定) ---
+        if len(self.players_hand[player]) == 0:
+            if player not in self.winner_order:
+                self.winner_order.append(player)
+                print(f"*** 玩家 {player} 出完了! (第 {len(self.winner_order)} 名) ***")
 
+        # 检查游戏结束 (只要3个人出完就结束)
+        if len(self.winner_order) >= 3:
+            self.game_over = True
+            return self.get_infoset(), 0, True, {}
+
+        # --- 4. 轮转到下一位 (关键逻辑) ---
+        next_p = (player + 1) % 4
+        while next_p in self.winner_order:
+            if len(self.winner_order) == 4: break 
+            next_p = (next_p + 1) % 4
+        
+        # 检查是否获得“接风”或新一轮出牌权
+        # 如果 last_pid 也是 next_p (说明其他人都要不起，转回自己了)，或者 last_pid 已经赢了走了
+        # 这里简化逻辑：如果上一手牌的打出者就是下家自己，或者上一手牌打出者已经离场（这种其实需要更复杂的接风逻辑）
+        # 我们暂时只处理：转了一圈没人要，轮到自己 -> 清空 last_move
+        if self.last_pid == next_p:
+            print(f"--- 没人要，玩家 {next_p} 获得出牌权 ---")
+            self.last_move = []
+        
+        # 更新当前玩家
+        self.current_player = next_p
+        
+        return self.get_infoset(), 0, self.game_over, {}
+    
     def _can_beat(self, cur_move, last_move):
-        """比较牌力逻辑"""
+        """比较牌力逻辑：判断 cur_move 是否能管住 last_move"""
         t1, r1 = cur_move['type'], cur_move['rank']
         t2, r2 = last_move['type'], last_move['rank']
         
@@ -105,27 +127,32 @@ class GameEnv:
         if t2 == TYPE_KING_BOMB: return False
         
         # 2. 炸弹比较 (含同花顺)
-        # 炸弹等级：同花顺 > 5炸 > 4炸
-        # 掼蛋中：6炸 > 同花顺 > 5炸 > 4炸 (具体规则有变种，这里按 6炸>同花顺>5炸)
+        # 掼蛋炸弹等级一般规则：6炸及以上 > 同花顺 > 5炸 > 4炸
+        # (这里为了简化，我们暂时使用一个分数来代表炸弹等级)
         def get_bomb_score(m_type, count, rank):
             # 给炸弹打分，用于跨类型比较
-            if m_type == TYPE_STRAIGHT_FLUSH: return 5.5 # 介于5炸和6炸之间
-            if m_type == TYPE_BOMB: return count
+            if m_type == TYPE_STRAIGHT_FLUSH: return 5.5 # 设定同花顺比5炸大，比6炸小
+            if m_type == TYPE_BOMB: return count # 4炸得4分，5炸得5分...
+            if m_type == TYPE_KING_BOMB: return 100
             return 0 # 不是炸弹
 
-        score1 = get_bomb_score(t1, cur_move['count'], r1)
-        score2 = get_bomb_score(t2, last_move.get('count',0), r2) # last_move count需要 detector 返回
+        # 获取 last_move 的 count，如果没有则默认为 0
+        last_count = last_move.get('count', 0)
         
-        # 如果都是炸弹 (分值 > 0)
+        score1 = get_bomb_score(t1, cur_move['count'], r1)
+        score2 = get_bomb_score(t2, last_count, r2) 
+        
+        # 如果其中一方是炸弹 (分值 > 0)
         if score1 > 0 or score2 > 0:
-            if score1 > score2: return True
-            if score1 < score2: return False
-            # 同等级炸弹，比点数
+            if score1 > score2: return True # 炸弹等级高这就赢
+            if score1 < score2: return False # 炸弹等级低这就输
+            # 同等级炸弹，比点数 (例如都是4炸，AAAA > KKKK)
             return r1 > r2
             
         # 3. 普通牌型比较
-        # 必须同类型、同张数 (MoveDetector 已经通过类型隐含了张数检查，如同是顺子都是5张)
+        # 必须同类型
         if t1 != t2: return False
-        if cur_move['count'] != last_move['count']: return False
-        
+        # 必须同张数 (例如对子只能管对子，三带二只能管三带二)
+        if cur_move['count'] != last_count: return False
+        # 比主牌点数
         return r1 > r2
