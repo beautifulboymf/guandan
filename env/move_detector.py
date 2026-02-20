@@ -62,8 +62,9 @@ class MoveDetector:
 
         # --- 单张 ---
         if n == 1:
-            return {'type': TYPE_SINGLE, 'rank': normal_ranks[0], 'count': 1}
-
+            rank = normal_ranks[0] if normal_ranks else 15
+            return {'type': TYPE_SINGLE, 'rank': rank, 'count': 1}
+        
         # --- 对子 ---
         if n == 2:
             if len(set(normal_ranks)) <= 1:

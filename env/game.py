@@ -7,16 +7,19 @@ class InfoSet:
     """玩家视角的观察数据"""
     def __init__(self, player_id):
         self.player_id = player_id
-        self.my_hand = []      # 我的手牌ID
-        self.others_num = {}   # 其他人剩余牌数
-        self.last_move = []    # 上一家的出牌
-        self.last_pid = -1     # 谁出的上一手牌
-        self.cur_level = 2     # 当前打几
+        self.my_hand = []         # 我的手牌ID
+        self.others_num = {}      # 其他人剩余牌数
+        self.last_move = []       # 上一家的出牌
+        self.last_pid = -1        # 谁出的上一手牌
+        self.cur_level = 2        # 当前打几
+        self.winner_order = []
+        self.action_history = []  # 记录整局对战的出牌历史
 
 class GameEnv:
     def __init__(self):
         self.num_players = 4
         self.deck = list(range(108)) # 0-107
+        self.action_history = []  # [新增] 初始化记忆库
         self.reset()
 
     def reset(self, current_level=2):
@@ -34,24 +37,22 @@ class GameEnv:
 
         # 状态初始化
         self.current_player = 0 
-        self.last_move = []    # 桌面上的最后一手牌
-        self.last_pid = -1     # 最后一手牌是谁出的
-        self.pass_count = 0    # 连续 PASS 的次数
+        self.last_move = []       # 桌面上的最后一手牌
+        self.last_pid = -1        # 最后一手牌是谁出的
+        self.pass_count = 0       # 连续 PASS 的次数
+        self.action_history = []  # [新增] 每局重新开始时清空记忆
         
-        # 记录每队的级数 (用于结算) - 简化起见这里只存储当前级
-        # 实际项目中应由外部控制级数流转
-
         return self.get_infoset()
 
     def get_infoset(self):
         """生成当前玩家的观察状态"""
         info = InfoSet(self.current_player)
         info.my_hand = self.players_hand[self.current_player]
-        # 获取其他人在场玩家的手牌数
         info.others_num = {i: len(self.players_hand[i]) for i in range(4) if i != self.current_player}
         info.last_move = self.last_move
         info.last_pid = self.last_pid
         info.cur_level = self.cur_level
+        info.action_history = self.action_history.copy() # [新增] 把环境记忆拷贝给玩家视野
         return info
 
     def step(self, action):
@@ -84,10 +85,14 @@ class GameEnv:
             for card in action:
                 self.players_hand[player].remove(card)
             print(f"玩家 {player} 出牌: {move_info['type']} (Rank {move_info['rank']})")
-
+            
+            # [新增] 记录合法出牌
+            self.action_history.append({'player_id': player, 'action': action})
         else:
             self.pass_count += 1
             print(f"玩家 {player} PASS")
+            # [新增] 记录合法 PASS (PASS也是重要情报)
+            self.action_history.append({'player_id': player, 'action': []})
 
         # === 3. 检查当前玩家是否出完 ===
         if len(self.players_hand[player]) == 0:
@@ -109,8 +114,7 @@ class GameEnv:
             result = self._calculate_result()
             return self.get_infoset(), 0, True, {'result': result}
 
-        # === 5. 轮转与接风逻辑 (已修正 Bug) ===
-        
+        # === 5. 轮转与接风逻辑 ===
         active_players = [i for i in range(4) if len(self.players_hand[i]) > 0]
         num_active = len(active_players)
         
@@ -122,10 +126,6 @@ class GameEnv:
         should_clear_table = False
         winner_next_p = next_p 
 
-        # --- 修正逻辑开始 ---
-        # 计算清台所需的 PASS 数量
-        # 如果牌主(last_pid)还在场，只要 N-1 个人不要就行（除了牌主自己）
-        # 如果牌主(last_pid)已离场，需要 N 个人都不要（剩下所有人）
         if len(self.players_hand[self.last_pid]) > 0:
             pass_threshold = num_active - 1
         else:
@@ -140,7 +140,6 @@ class GameEnv:
                 winner_next_p = self.last_pid
                 print(f"-> 玩家 {winner_next_p} 获得出牌权")
             else:
-                # 牌主已走，优先对家接风
                 teammate = (self.last_pid + 2) % 4
                 if len(self.players_hand[teammate]) > 0:
                     winner_next_p = teammate
@@ -150,7 +149,6 @@ class GameEnv:
                     print(f"-> 最大牌玩家及队友均已走，下家 {winner_next_p} 接风")
             
             self.pass_count = 0
-        # --- 修正逻辑结束 ---
         
         if should_clear_table:
             self.last_move = []
@@ -161,10 +159,9 @@ class GameEnv:
         return self.get_infoset(), 0, False, {}
 
     def _can_beat(self, cur_move, last_move):
-        """比较牌力逻辑"""
+        # ... (与原版相同，略过以节省空间，直接用你上面的即可，我已完整保留逻辑) ...
         t1, r1 = cur_move['type'], cur_move['rank']
         t2, r2 = last_move['type'], last_move['rank']
-        
         if t1 == TYPE_KING_BOMB: return True
         if t2 == TYPE_KING_BOMB: return False
         
@@ -187,39 +184,30 @@ class GameEnv:
         return r1 > r2
 
     def _calculate_result(self):
-        """结算胜负与升级"""
-        # winner_order 存储了出完牌的顺序，例如 [0, 2, 1] (0和2一队，1和3一队)
-        # 还没出完的人算最后一名
-        
-        team_A = [0, 2] # 玩家 0, 2
-        team_B = [1, 3] # 玩家 1, 3
-        
+        # ... (与原版完全相同) ...
+        team_A = [0, 2] 
+        team_B = [1, 3] 
         first = self.winner_order[0]
-        
-        # 判断是哪队拿了头游
         win_team_idx = 'A' if first in team_A else 'B'
         
-        # 查找队友的名次
         teammate = (first + 2) % 4
-        teammate_rank = -1 # 没出完
+        teammate_rank = -1 
         if teammate in self.winner_order:
-            # index是从0开始的，所以名次是 index + 1
             teammate_rank = self.winner_order.index(teammate) + 1
         else:
-            teammate_rank = 4 # 最后一名
+            teammate_rank = 4 
             
         result_str = ""
         level_up = 0
-        
         if teammate_rank == 2:
             result_str = f"Team {win_team_idx} 双上 (头游+二游)"
-            level_up = 3 # 升3级
+            level_up = 3 
         elif teammate_rank == 3:
             result_str = f"Team {win_team_idx} 单上 (头游+三游)"
-            level_up = 2 # 升2级
-        else: # teammate_rank == 4
+            level_up = 2 
+        else:
             result_str = f"Team {win_team_idx} 平局/单上 (头游+末游)"
-            level_up = 1 # 升1级
+            level_up = 1 
             
         return {
             'winner': win_team_idx,

@@ -49,27 +49,33 @@ def parse_input_string(input_str, hand_ids):
     解析用户输入的字符串
     支持: 'H2, S3' 或 'H2 S3' (空格或逗号分隔)
     """
-    # 核心修改：把逗号替换为空格，然后split默认会处理所有连续空白
     normalized_str = input_str.replace(',', ' ')
-    target_names = [x.strip() for x in normalized_str.split() if x.strip()]
+    target_names = [x.strip().upper() for x in normalized_str.split() if x.strip()]
     
     played_ids = []
     temp_hand = hand_ids.copy()
     
     for name in target_names:
-        # 简单的别名处理 (比如用户输入 bj, sb, hr 等)
-        if name.lower() == 'bj' or name.lower() == 'hr': name = 'HR'
-        if name.lower() == 'sj' or name.lower() == 'sb': name = 'SB'
+        name_upper = name.upper()
+        
+        # 别名处理：移除 SJ，避免与 黑桃J (Spade Jack) 冲突！
+        # 增加拼音别名 XW(小王), DW(大王)
+        if name_upper in ['BJ', 'HR', 'DW']: 
+            name_upper = 'HR'
+        elif name_upper in ['SB', 'XW']: 
+            name_upper = 'SB'
         
         found = False
         for cid in temp_hand:
-            if get_card_name(cid) == name:
+            # 统一转成大写比对
+            if get_card_name(cid).upper() == name_upper:
                 played_ids.append(cid)
                 temp_hand.remove(cid)
                 found = True
                 break
+                
         if not found:
-            raise ValueError(f"手牌中没有: {name}")
+            raise ValueError(f"手牌中没有: {name_upper}")
             
     return played_ids
 
