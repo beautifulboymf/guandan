@@ -31,7 +31,7 @@ def evaluate(model, device, eval_episodes=20):
     model.eval() # 开启评估模式
     for _ in range(eval_episodes):
         rand_level = random.randint(2, 14)
-        obs = env_wrapper.reset(current_level=2)
+        obs = env_wrapper.reset(rand_level)
         while True:
             cur_player = obs['player_id']
             legal_actions = obs['legal_actions']
@@ -142,8 +142,8 @@ def train():
             
             b_query = b_query.view(-1, 216)
             b_context = b_context.view(-1, 112)
-            b_history = b_history.view(-1, 40, 112)
-            b_mask = b_mask.view(-1, 40)
+            b_history = b_history.view(-1, 64, 112)
+            b_mask = b_mask.view(-1, 64)
             b_target = b_target.view(-1, 1) 
             
             learner_model.train()

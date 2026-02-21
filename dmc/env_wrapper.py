@@ -12,8 +12,8 @@ from env.move_generator import MoveGenerator
 from env.move_detector import MoveDetector
 from env.settings import TYPE_BOMB, TYPE_STRAIGHT_FLUSH, TYPE_KING_BOMB 
 
-# 【优化 1】扩充历史记忆，足以覆盖一整局
-MAX_HISTORY = 40 
+# 【升级】：历史记忆窗口扩容至 64 手，足以覆盖整局游戏从头到尾的绝对记忆
+MAX_HISTORY = 64 
 
 def cards2array(card_ids):
     vec = np.zeros(108, dtype=np.float32)
@@ -72,6 +72,7 @@ class GuandanEnvWrapper:
                 continue
             if last_pid == teammate_pid and is_bomb and my_hand_len > 5:
                 continue
+                
             pruned.append(action)
             
         return pruned if pruned else legal_actions
@@ -80,7 +81,6 @@ class GuandanEnvWrapper:
         me = infoset.player_id
         cur_level_idx = infoset.cur_level - 2
         
-        # 1. Context Feature 
         played_cards = []
         for item in infoset.action_history:
             if item['action']: played_cards.extend(item['action'])
@@ -88,22 +88,21 @@ class GuandanEnvWrapper:
         unseen_cards = set(range(108)) - set(infoset.my_hand) - set(played_cards)
         unseen_feat = cards2array(list(unseen_cards)) 
         
-        level_feat = np.zeros(13, dtype=np.float32)
-        if 0 <= cur_level_idx < 13: level_feat[cur_level_idx] = 1.0
+        safe_level_idx = max(0, min(12, cur_level_idx))
+        level_feat = np.array([safe_level_idx], dtype=np.float32) 
         
-        # 【优化 2】极其精简且无损的信息量：直接传入 3 个整数 (0~27)
         right, teammate, left = (me + 1) % 4, (me + 2) % 4, (me + 3) % 4
-        cards_num_feat = np.zeros(3, dtype=np.float32)
+        cards_num_feat = np.zeros(3, dtype=np.float32) 
         for i, pid in enumerate([right, teammate, left]):
             cards_num_feat[i] = float(min(infoset.others_num.get(pid, 0), 27))
             
-        # 此时 context_feat 维度: 108 + 13 + 3 = 124 维
         context_feat = np.concatenate([unseen_feat, level_feat, cards_num_feat]) 
 
-        # 2. History Features 
+        # 这里的 112 维特征是 4维相对位置 + 108维手牌
         history_feats = np.zeros((MAX_HISTORY, 112), dtype=np.float32) 
         history_mask = np.zeros(MAX_HISTORY, dtype=np.float32)         
         
+        # 【时间轴共识】：切片 [-MAX_HISTORY:] 天然保证了最早发生的在 index 0，最新的在末尾。右侧填充零。
         recent_history = infoset.action_history[-MAX_HISTORY:]
         
         for i, item in enumerate(recent_history):
@@ -113,11 +112,9 @@ class GuandanEnvWrapper:
             pos_feat[rel_pos] = 1.0
             act_feat = cards2array(action)
             
-            # 这里依然保持 112 维拼接，我们在 PyTorch 模型内部去解剖它
             history_feats[i] = np.concatenate([pos_feat, act_feat])
             history_mask[i] = 1.0
 
-        # 3. 动作提取与组装
         last_move_info = None
         if infoset.last_move and infoset.last_pid != me:
             last_move_info = MoveDetector.get_move_type(infoset.last_move, cur_level_idx)

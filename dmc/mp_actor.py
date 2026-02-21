@@ -8,7 +8,7 @@ from dmc.agents import HeuristicAgent
 
 # 每块 (Chunk) 包含的样本数。Actor 跨局攒够 32 步就打包发给 Learner
 UNROLL_LENGTH = 32 
-MAX_HISTORY = 40
+MAX_HISTORY = 64
 
 def create_buffers(num_buffers):
     T = UNROLL_LENGTH
