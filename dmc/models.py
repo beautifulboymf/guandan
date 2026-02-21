@@ -2,119 +2,142 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class ResBlock(nn.Module):
+    """标准的残差块，带有 LayerNorm 和 LeakyReLU，稳定深度网络的梯度"""
+    def __init__(self, dim):
+        super(ResBlock, self).__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.ln1 = nn.LayerNorm(dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.ln2 = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        residual = x
+        out = F.leaky_relu(self.ln1(self.fc1(x)), negative_slope=0.01)
+        out = self.ln2(self.fc2(out))
+        return F.leaky_relu(out + residual, negative_slope=0.01)
+
 class GuandanModel(nn.Module):
     """
-    掼蛋 DMC 核心模型：结合 MLP 与 Cross-Attention 架构
-    专门用于评估一个 (State, Action) 组合的最终胜率。
+    掼蛋 DMC 终极模型：多分支特征均衡(Embedding) + ResNet + Cross-Attention
     """
     def __init__(self, hidden_dim=256):
         super(GuandanModel, self).__init__()
         
         # ==========================================
-        # 1. 独立特征编码器 (Encoders)
+        # 1. Query Encoder (216 -> 256)
         # ==========================================
-        # Query 编码器 (我的手牌 108 + 候选动作 108 = 216)
         self.query_encoder = nn.Sequential(
             nn.Linear(216, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.01),
+            ResBlock(hidden_dim)
         )
         
-        # Context 编码器 (未知牌 108 + 级牌 13 + 剩余牌数 84 = 205)
-        self.context_encoder = nn.Sequential(
-            nn.Linear(205, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+        # ==========================================
+        # 2. Context 深度重构 (解决信息维度碾压)
+        # ==========================================
+        # 未知牌: 108维 -> 128维
+        self.unseen_emb = nn.Sequential(nn.Linear(108, 128), nn.LeakyReLU(0.01))
+        
+        # 级牌整数(0~12): 通过 Embedding 映射为 64 维稠密向量
+        self.level_emb = nn.Embedding(num_embeddings=13, embedding_dim=64)
+        
+        # 三人牌数整数(0~27): 通过 Embedding 为每个数字映射 32 维稠密向量
+        self.cards_num_emb = nn.Embedding(num_embeddings=28, embedding_dim=32)
+        
+        # 融合拼接: 128(未知牌) + 64(级牌向量) + 3*32(三个人牌数向量) = 288 维
+        self.context_fusion = nn.Sequential(
+            nn.Linear(288, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            ResBlock(hidden_dim)
         )
         
-        # History 编码器 (谁出的 4 + 出的牌 108 = 112)
-        self.history_encoder = nn.Sequential(
-            nn.Linear(112, hidden_dim),
-            nn.ReLU()
+        # ==========================================
+        # 3. History 深度重构 (解耦位置与动作)
+        # ==========================================
+        # 位置: 4维 -> 升维到 32维
+        self.hist_pos_emb = nn.Sequential(nn.Linear(4, 32), nn.LeakyReLU(0.01))
+        # 牌型: 108维 -> 升维到 128维
+        self.hist_act_emb = nn.Sequential(nn.Linear(108, 128), nn.LeakyReLU(0.01))
+        
+        # 拼接融合: 32 + 128 = 160 维 -> 映射到 hidden_dim (256)
+        self.history_fusion = nn.Sequential(
+            nn.Linear(160, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            ResBlock(hidden_dim)
         )
 
         # ==========================================
-        # 2. 交叉注意力层 (Cross-Attention)
+        # 4. Cross-Attention
         # ==========================================
-        # 使用 4 个注意力头来捕获多维度的出牌习惯
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim, 
             num_heads=4, 
-            batch_first=True
+            batch_first=True,
+            dropout=0.1 
         )
+        self.attn_ln = nn.LayerNorm(hidden_dim) 
         
         # ==========================================
-        # 3. 终极得分融合网络 (Fusion MLP)
+        # 5. Fusion MLP (融合全维特征输出最终得分)
         # ==========================================
-        # 拼接后的维度: Query(hidden) + Context(hidden) + AttentionOut(hidden) = 3 * hidden_dim
         self.fusion_net = nn.Sequential(
             nn.Linear(hidden_dim * 3, 512),
-            nn.ReLU(),
+            nn.LayerNorm(512),
+            nn.LeakyReLU(0.01),
+            ResBlock(512),       
             nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1) # 输出唯一的一个打分 (Q-value)
+            nn.LeakyReLU(0.01),
+            nn.Linear(256, 1)    
         )
 
     def forward(self, query, context, history, history_mask):
-        """
-        前向传播计算打分。
-        参数维度:
-            query:        [Batch_Size, 216]
-            context:      [Batch_Size, 205]
-            history:      [Batch_Size, 15, 112]
-            history_mask: [Batch_Size, 15]  (1为真实数据，0为Padding)
-        """
-        # 1. 编码基础特征 -> [Batch_Size, hidden_dim]
-        q_feat = F.relu(self.query_encoder(query))
-        c_feat = F.relu(self.context_encoder(context))
+        # 1. 编码 Query
+        q_feat = self.query_encoder(query)
         
-        # 2. 编码历史特征 -> [Batch_Size, 15, hidden_dim]
-        h_feat = self.history_encoder(history)
+        # 2. 截断、提取并分别查表/编码 Context
+        # context 现长度 112 = 108(unseen) + 1(level整数) + 3(cards_num整数)
+        unseen_cards = context[:, :108]
+        level_info = context[:, 108].long()          # 第 108 位是级牌
+        cards_num = context[:, 109:112].long()       # 第 109~111 位是三人剩余牌数
         
-        # ==========================================
-        # 3. Cross-Attention 计算
-        # ==========================================
-        # 核心逻辑：用当前状态 (Query + Context) 去“检索”历史记录
-        # 合并局部视角和大局视角作为 Transformer 的 Query
+        u_feat = self.unseen_emb(unseen_cards)
+        l_feat = self.level_emb(level_info)          # 查表得到 [Batch, 64]
+        n_feat = self.cards_num_emb(cards_num).view(-1, 3 * 32) # 查表 [Batch, 3, 32] -> 展平 [Batch, 96]
+        
+        # 拼接融合
+        c_feat = self.context_fusion(torch.cat([u_feat, l_feat, n_feat], dim=1))
+        
+        # 3. 截断、提取并分别编码 History
+        # history 原长度 112 = 4(pos) + 108(act)
+        pos_info = history[:, :, :4]
+        act_info = history[:, :, 4:]
+        
+        p_feat = self.hist_pos_emb(pos_info)         # [Batch, Seq_Len, 32]
+        a_feat = self.hist_act_emb(act_info)         # [Batch, Seq_Len, 128]
+        
+        h_feat = self.history_fusion(torch.cat([p_feat, a_feat], dim=-1))
+        
+        # 4. Cross-Attention
         state_rep = q_feat + c_feat 
+        attn_query = state_rep.unsqueeze(1) 
         
-        # MultiheadAttention 需要的 Q 维度是 [Batch_Size, Seq_Len, Embed_Dim]
-        # 我们只有一个 state_rep，所以 Seq_Len = 1
-        attn_query = state_rep.unsqueeze(1) # [Batch_Size, 1, hidden_dim]
-        
-        # K 和 V 都是历史序列
-        attn_key = h_feat   # [Batch_Size, 15, hidden_dim]
-        attn_value = h_feat # [Batch_Size, 15, hidden_dim]
-        
-        # 处理掩码陷阱：
-        # PyTorch 的 key_padding_mask 要求需要忽略(Padding)的位置是 True！
-        # 我们的 mask 是 1 代表有效，0 代表忽略。所以这里要反转一下。
-        padding_mask = (history_mask == 0.0) # [Batch_Size, 15]
-        
-        # 安全保护机制：如果游戏刚开局，所有的历史都是 0 (全被 mask 了)
-        # PyTorch 会报错或者输出 NaN。所以如果有一整行全是 True，我们强行把第一个位置设为 False 放行。
+        padding_mask = (history_mask == 0.0) 
         all_masked = padding_mask.all(dim=1)
         if all_masked.any():
             padding_mask[all_masked, 0] = False 
             
-        # 扔进注意力机制
         attn_out, _ = self.cross_attention(
             query=attn_query, 
-            key=attn_key, 
-            value=attn_value, 
+            key=h_feat, 
+            value=h_feat, 
             key_padding_mask=padding_mask
         )
+        attn_out = self.attn_ln(attn_out.squeeze(1) + state_rep) 
         
-        # 拿掉 Seq_Len 那个多余的维度 -> [Batch_Size, hidden_dim]
-        attn_out = attn_out.squeeze(1) 
-        
-        # ==========================================
-        # 4. 融合与输出
-        # ==========================================
-        # 把“当前的企图 (q)”、“场上的大局 (c)”、以及“历史的教训 (attn_out)” 拼在一起！
-        final_rep = torch.cat([q_feat, c_feat, attn_out], dim=1) # [Batch_Size, 256 * 3 = 768]
-        
-        # 计算最终得分 -> [Batch_Size, 1]
+        # 5. 输出打分
+        final_rep = torch.cat([q_feat, c_feat, attn_out], dim=1) 
         score = self.fusion_net(final_rep)
         
         return score
