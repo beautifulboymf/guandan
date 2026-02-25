@@ -20,42 +20,41 @@ class RandomAgent:
 
     def act(self, infoset):
         cur_level_idx = infoset.cur_level - 2
-        
-        # 解析桌面上的最后一手牌
         last_move_info = None
         if infoset.last_move and infoset.last_pid != self.player_id:
             last_move_info = MoveDetector.get_move_type(infoset.last_move, cur_level_idx)
-            
-        # 获取所有合法动作
         generator = MoveGenerator(infoset.my_hand, cur_level_idx)
         legal_actions = generator.get_legal_actions(last_move_info)
-        
-        # 随机挑一个
         return random.choice(legal_actions)
+
 
 class HeuristicAgent:
     """
-    启发式规则智能体 (基准 Bot)
-    策略：只要有牌能管上上家，就绝对不 PASS。
-    跟牌时：挑刚好能管上的、代价最小的那一组牌出。
-    先手时：随机挑选一种手里的牌型组合（单张/对子/顺子等），打出该组合中最小的，更具人性化。
+    【高阶进化版】启发式规则智能体 (大师 Bot)
+    包含特性：
+    1. 队友意识：队友牌少时主动喂牌（单/对）；队友出大牌时主动让路。
+    2. 牌型梳理：寻找有“大、小”重复的组合（如两组钢板），打出小的骗炸弹/回手。
     """
     def __init__(self, player_id):
         self.player_id = player_id
 
     def act(self, infoset):
         cur_level_idx = infoset.cur_level - 2
+        me = self.player_id
+        
+        # 获取队友的 ID 和剩余牌数
+        teammate_id = (me + 2) % 4
+        teammate_cards_num = infoset.others_num.get(teammate_id, 27)
         
         # 1. 解析上家出牌
         last_move_info = None
-        if infoset.last_move and infoset.last_pid != self.player_id:
+        if infoset.last_move and infoset.last_pid != me:
             last_move_info = MoveDetector.get_move_type(infoset.last_move, cur_level_idx)
             
         # 2. 生成合法动作
         generator = MoveGenerator(infoset.my_hand, cur_level_idx)
         legal_actions = generator.get_legal_actions(last_move_info)
 
-        # 剥离出所有的实体动作 (去掉 PASS)
         real_actions = [a for a in legal_actions if a != []]
 
         # 如果真的没有任何牌能打，只能 PASS
@@ -66,11 +65,12 @@ class HeuristicAgent:
         scored_actions = []
         for action in real_actions:
             move_info = MoveDetector.get_move_type(action, cur_level_idx)
+            if not move_info: continue
             t = move_info['type']
             r = move_info['rank']
             c = move_info['count']
             
-            # 精准量化牌的“代价”: (是否是炸弹, 张数/威力大小, 逻辑点数)
+            # 代价打分机制 (是否是炸弹, 张数/威力大小, 逻辑点数)
             if t == TYPE_KING_BOMB:
                 score = (1, 10, 30)      
             elif t == TYPE_STRAIGHT_FLUSH:
@@ -80,38 +80,64 @@ class HeuristicAgent:
             else:
                 score = (0, c, r)        
                 
-            # 我们把 move_info 也存进去，方便后续提炼牌型
             scored_actions.append((score, action, move_info))
             
-        # 4. 决策逻辑
+        # ==========================================
+        # 4. 核心决策大脑
+        # ==========================================
         if last_move_info is None:
-            # ==========================================
-            # 【人性化先手逻辑】：随机出组合牌
-            # ==========================================
-            # 把炸弹和普通牌分开
+            # 【场景 A：先手出牌】
             non_bombs = [item for item in scored_actions if item[0][0] == 0]
             
             if non_bombs:
-                # 看看当前手里能凑出哪些普通牌型 (如 TYPE_SINGLE, TYPE_PAIR, TYPE_STRAIGHT 等)
-                available_types = list(set(item[2]['type'] for item in non_bombs))
+                # --- 机制 1：残局喂牌 ---
+                # 如果队友只剩 <= 5 张牌，极大可能只需要单张或对子就能走掉
+                if teammate_cards_num <= 5:
+                    feed_candidates = [item for item in non_bombs if item[2]['type'] in [TYPE_SINGLE, TYPE_PAIR]]
+                    if feed_candidates:
+                        # 挑最小的单张或对子打，送队友走
+                        feed_candidates.sort(key=lambda x: x[0][2])
+                        return feed_candidates[0][1]
                 
-                # 随机挑一种牌型来探路！(比如随机决定这把先出顺子)
-                chosen_type = random.choice(available_types)
+                # --- 机制 2：高级牌型梳理 (诱导/回手) ---
+                # 将可出的牌按类型分组 (比如收集手里所有的顺子、钢板、三带二)
+                type_lists = {}
+                for item in non_bombs:
+                    t = item[2]['type']
+                    if t not in type_lists: type_lists[t] = []
+                    type_lists[t].append(item)
+                    
+                # 寻找手里拥有 2 组及以上的牌型 (就像你说的：有大有小，可以回手！)
+                multi_types = [t for t, acts in type_lists.items() if len(acts) >= 2]
                 
-                # 筛选出选定牌型的所有动作
-                candidates = [item for item in non_bombs if item[2]['type'] == chosen_type]
+                if multi_types:
+                    # 在这些能回手的牌型里，挑出最“庞大/复杂”的 (比如有钢板有对子，优先发钢板)
+                    best_type = max(multi_types, key=lambda t: type_lists[t][0][2]['count'])
+                else:
+                    # 如果没有重复的，就顺着手牌，把张数最多的组合打掉 (比如唯一的长顺子)
+                    best_type = max(type_lists.keys(), key=lambda t: type_lists[t][0][2]['count'])
+                    
+                candidates = type_lists[best_type]
                 
-                # 在这种牌型里，挑点数最小的打出去 (按 rank 排序)
+                # 核心：出该组里【最小】的那一个！探路、消耗对手炸弹、或等待用手里大的回手！
                 candidates.sort(key=lambda x: x[0][2])
                 return candidates[0][1]
             else:
-                # 如果手里全是炸弹，那就出最小的炸弹
+                # 绝境：手里全剩炸弹了，出最小的炸弹
                 scored_actions.sort(key=lambda x: x[0])
                 return scored_actions[0][1]
                 
         else:
-            # ==========================================
-            # 【跟牌逻辑】：保持原样，最小代价压制
-            # ==========================================
+            # 【场景 B：跟牌压制】
+            if infoset.last_pid == teammate_id:
+                # --- 机制 3：极度聪明的队友让路 ---
+                # 如果队友快跑完了，直接过，死也不挡路！
+                if teammate_cards_num <= 5:
+                    return []
+                # 如果队友出的牌已经具备统治力（逻辑点数 >= 11，即 J,Q,K,A），保留实力，让他飞！
+                if last_move_info['rank'] >= 11:
+                    return []
+                    
+            # 正常压制对手：在能管上的牌里，挑代价最小的（最抠门）
             scored_actions.sort(key=lambda x: x[0])
             return scored_actions[0][1]
